@@ -114,7 +114,7 @@ jobs:
 
           # Configuration variables
           REPO_URL="https://github.com/getwithashish/frappe_docker.git"
-          PROJECT_DIR=${HOME}/${{ secrets.GCP_VM_PROJECT_PATH }}
+          PROJECT_DIR="${{ secrets.GCP_VM_PROJECT_PATH }}"
 
           # Efficient Docker environment setup
           ensure_docker_environment() {
