@@ -1,4 +1,4 @@
-name: Build and Push Docker Image on Tag
+name: Build, Push, and Deploy on Tag
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     environment: production
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,29 +22,29 @@ jobs:
         id: apps_json
         run: |
           echo "Checking for apps.json file..."
-          
+
           if [ ! -f "apps.json" ]; then
             echo "❌ ERROR: apps.json file not found in root directory"
             echo "Please create an apps.json file in the repository root"
             exit 1
           fi
-          
+
           echo "✅ apps.json file found"
           echo "📄 Content of apps.json:"
           cat apps.json
-          
+
           # Validate JSON syntax
           if ! python3 -m json.tool apps.json > /dev/null 2>&1; then
             echo "❌ ERROR: apps.json is not valid JSON"
             exit 1
           fi
-          
+
           echo "✅ apps.json is valid JSON"
-          
+
           # Convert to base64
           APPS_JSON_BASE64=$(cat apps.json | base64 -w 0)
           echo "APPS_JSON_BASE64=$APPS_JSON_BASE64" >> $GITHUB_OUTPUT
-          
+
           echo "✅ apps.json successfully encoded to base64"
 
       - name: Set up QEMU (for multi-platform builds)
@@ -72,6 +72,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -85,13 +86,264 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Image digest
-        run: echo ${{ steps.build-and-push.outputs.digest }}
-
       - name: Build Summary
         run: |
           echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Tag**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Image**: ${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tags**: ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Digest**: ${{ steps.build-and-push.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest**: ${{ steps.build.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Setup SSH key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GCP_VM_SSH_KEY }}
+
+      - name: Deploy to GCP VM with Smart Setup
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }} << 'EOF'
+          set -e  # Exit on any error
+
+          echo "🚀 Starting smart deployment process..."
+
+          # Configuration variables
+          REPO_URL="https://github.com/getwithashish/frappe_docker.git"
+          PROJECT_DIR="${{ secrets.GCP_VM_PROJECT_PATH }}"
+
+          # Efficient Docker environment setup
+          ensure_docker_environment() {
+            echo "🔧 Ensuring Docker environment is ready..."
+
+            # Update package list
+            sudo apt-get update
+
+            # Install Docker if not present
+            if ! command -v docker &> /dev/null; then
+              echo "📦 Installing Docker..."
+              curl -fsSL https://get.docker.com -o get-docker.sh
+              sudo sh get-docker.sh
+              sudo usermod -aG docker $USER
+              rm get-docker.sh
+              echo "✅ Docker installed"
+            else
+              echo "✅ Docker already installed"
+            fi
+
+            # Install Docker Compose plugin via package manager (most efficient)
+            if ! docker compose version &> /dev/null; then
+              echo "📦 Installing Docker Compose plugin..."
+              sudo apt-get install -y docker-compose-plugin
+              echo "✅ Docker Compose plugin installed"
+            else
+              echo "✅ Docker Compose plugin already installed"
+            fi
+
+            # Ensure user is in docker group
+            if ! groups $USER | grep -q docker; then
+              echo "👥 Adding user to docker group..."
+              sudo usermod -aG docker $USER
+              # Create a new shell session with updated group membership
+              exec sg docker "$0"
+            fi
+
+            # Verify installation
+            echo "🔍 Verifying Docker installation..."
+            docker --version
+            docker compose version
+            echo "✅ Docker environment ready"
+          }
+
+          # Function to setup the project directory and repository
+          setup_project() {
+            echo "📁 Setting up project directory and repository..."
+
+            # Create parent directory if it doesn't exist
+            PARENT_DIR=$(dirname "$PROJECT_DIR")
+            if [ ! -d "$PARENT_DIR" ]; then
+              echo "📁 Creating parent directory: $PARENT_DIR"
+              mkdir -p "$PARENT_DIR"
+            fi
+
+            # Check if project directory exists
+            if [ ! -d "$PROJECT_DIR" ]; then
+              echo "📁 Project directory doesn't exist. Creating: $PROJECT_DIR"
+              mkdir -p "$PROJECT_DIR"
+
+              # Clone the repository
+              echo "📥 Cloning repository..."
+              git clone "$REPO_URL" "$PROJECT_DIR"
+              echo "✅ Repository cloned successfully"
+            else
+              echo "📁 Project directory exists: $PROJECT_DIR"
+
+              # Check if it's a git repository
+              if [ -d "$PROJECT_DIR/.git" ]; then
+                echo "📥 Git repository found. Pulling latest changes..."
+                cd "$PROJECT_DIR"
+
+                # Stash any local changes
+                git stash push -m "Auto-stash before deployment $(date)"
+
+                # Ensure we're on the correct branch and pull latest changes
+                git fetch origin
+
+                # Try to checkout main, then master, then stay on current branch
+                if git show-ref --verify --quiet refs/remotes/origin/main; then
+                  git checkout main
+                  git pull origin main
+                elif git show-ref --verify --quiet refs/remotes/origin/master; then
+                  git checkout master
+                  git pull origin master
+                else
+                  echo "Using current branch: $(git branch --show-current)"
+                  git pull origin $(git branch --show-current)
+                fi
+
+                echo "✅ Repository updated successfully"
+              else
+                echo "❌ Directory exists but is not a git repository"
+                echo "🔄 Removing existing directory and cloning fresh..."
+                rm -rf "$PROJECT_DIR"
+                git clone "$REPO_URL" "$PROJECT_DIR"
+                echo "✅ Fresh repository cloned successfully"
+              fi
+            fi
+          }
+
+          # Function to deploy the application
+          deploy_application() {
+            echo "🚀 Deploying application..."
+            cd "$PROJECT_DIR"
+
+            # Check if pwd.yml exists
+            if [ ! -f "pwd.yml" ]; then
+              echo "❌ ERROR: pwd.yml not found in $PROJECT_DIR"
+              echo "📋 Available files:"
+              ls -la
+              exit 1
+            fi
+
+            # Create backup of current state
+            echo "📦 Creating backup of current state..."
+            if docker compose -f pwd.yml ps -q | grep -q .; then
+              docker compose -f pwd.yml ps --format json > "backup-$(date +%Y%m%d-%H%M%S).json"
+            fi
+
+            echo "🐳 Pulling latest Docker images..."
+            docker compose -f pwd.yml pull
+
+            echo "🔄 Stopping existing containers..."
+            docker compose -f pwd.yml down --remove-orphans
+
+            echo "🏗️ Building and starting containers with latest images..."
+            docker compose -f pwd.yml up --build --force-recreate -d
+
+            # Wait for containers to start
+            echo "⏳ Waiting for containers to be ready..."
+            sleep 30
+
+            # Check if containers are running
+            if ! docker compose -f pwd.yml ps | grep -q "Up"; then
+              echo "❌ ERROR: Containers failed to start properly"
+              echo "📜 Container logs:"
+              docker compose -f pwd.yml logs
+              exit 1
+            fi
+
+            echo "🧹 Cleaning up old images..."
+            docker image prune -f
+
+            echo "📋 Current container status:"
+            docker compose -f pwd.yml ps
+
+            echo "✅ Application deployed successfully!"
+          }
+
+          # Function to perform health checks
+          perform_health_checks() {
+            echo "🔍 Performing health checks..."
+            cd "$PROJECT_DIR"
+
+            # Check container health
+            UNHEALTHY_CONTAINERS=$(docker compose -f pwd.yml ps --format json | jq -r '.[] | select(.Health == "unhealthy") | .Name' 2>/dev/null || echo "")
+
+            if [ -n "$UNHEALTHY_CONTAINERS" ]; then
+              echo "❌ Unhealthy containers detected: $UNHEALTHY_CONTAINERS"
+              echo "📜 Logs for unhealthy containers:"
+              echo "$UNHEALTHY_CONTAINERS" | while read container; do
+                echo "--- Logs for $container ---"
+                docker logs "$container" --tail=20
+              done
+              exit 1
+            fi
+
+            # Check if all expected containers are running
+            EXPECTED_SERVICES=$(docker compose -f pwd.yml config --services | wc -l)
+            RUNNING_SERVICES=$(docker compose -f pwd.yml ps --format json | jq -r '.[] | select(.State == "running")' | wc -l)
+
+            if [ "$RUNNING_SERVICES" -ne "$EXPECTED_SERVICES" ]; then
+              echo "❌ Not all services are running. Expected: $EXPECTED_SERVICES, Running: $RUNNING_SERVICES"
+              docker compose -f pwd.yml ps
+              exit 1
+            fi
+
+            echo "✅ All health checks passed!"
+          }
+
+          # Main execution flow
+          echo "1️⃣ Ensuring Docker environment is ready..."
+          ensure_docker_environment
+
+          echo "2️⃣ Setting up project and repository..."
+          setup_project
+
+          echo "3️⃣ Deploying application..."
+          deploy_application
+
+          echo "4️⃣ Performing health checks..."
+          perform_health_checks
+
+          echo "✅ Deployment completed successfully!"
+          echo "🎯 Deployed image: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}"
+          echo "🔗 Repository: $REPO_URL"
+          echo "📍 Location: $PROJECT_DIR"
+          EOF
+
+      - name: Verify Deployment Status
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_HOST }} << 'EOF'
+          cd "${{ secrets.GCP_VM_PROJECT_PATH }}"
+
+          echo "🔍 Final deployment verification..."
+
+          # Show running containers
+          echo "📊 Running containers:"
+          docker compose -f pwd.yml ps
+
+          # Show resource usage
+          echo "📈 Resource usage:"
+          docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+
+          # Show disk usage
+          echo "💾 Docker disk usage:"
+          docker system df
+
+          echo "✅ Deployment verification completed!"
+          EOF
+
+      - name: Deployment Summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: ${{ secrets.GCP_VM_HOST }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Project Path**: ${{ secrets.GCP_VM_PROJECT_PATH }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Latest Tag**: ${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Deployed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timestamp**: $(date -u)" >> $GITHUB_STEP_SUMMARY
