@@ -1,32 +1,120 @@
-[![Build Stable](https://github.com/frappe/frappe_docker/actions/workflows/build_stable.yml/badge.svg)](https://github.com/frappe/frappe_docker/actions/workflows/build_stable.yml)
-[![Build Develop](https://github.com/frappe/frappe_docker/actions/workflows/build_develop.yml/badge.svg)](https://github.com/frappe/frappe_docker/actions/workflows/build_develop.yml)
+## Custom Docker Image and App Installation for Frappe/ERPNext Deployment
 
-Everything about [Frappe](https://github.com/frappe/frappe) and [ERPNext](https://github.com/frappe/erpnext) in containers.
+This documentation guides you through setting up a custom Docker image using Frappe Docker, specifying required apps via `apps.json`, and modifying `docker-compose.yml` to automate app installation for an ERPNext environment.
 
-# Getting Started
+### 1. Prepare the `apps.json` File
 
-To get started you need [Docker](https://docs.docker.com/get-docker/), [docker-compose](https://docs.docker.com/compose/), and [git](https://docs.github.com/en/get-started/getting-started-with-git/set-up-git) setup on your machine. For Docker basics and best practices refer to Docker's [documentation](http://docs.docker.com).
+Create an `apps.json` file to define the list of Frappe/ERPNext apps you want included in your custom image. Example:
 
-Once completed, chose one of the following two sections for next steps.
+```json
+[
+  {
+    "url": "https://github.com/frappe/erpnext",
+    "branch": "version-15"
+  },
+  {
+    "url": "https://github.com/frappe/wiki",
+    "branch": "master"
+  }
+]
 
-### Try in Play With Docker
+```
 
-To play in an already set up sandbox, in your browser, click the button below:
+- For private repositories, use a URL embedded with a Personal Access Token (PAT) as needed.
+- Ensure any app dependencies (e.g., `erpnext` when using certain HRMS or payments modules) are listed explicitly in this array.
 
-<a href="https://labs.play-with-docker.com/?stack=https://raw.githubusercontent.com/frappe/frappe_docker/main/pwd.yml">
-  <img src="https://raw.githubusercontent.com/play-with-docker/stacks/master/assets/images/button.png" alt="Try in PWD"/>
-</a>
+### 2. Encode `apps.json` as Base64
 
-### Try on your Dev environment
+Convert your `apps.json` into a Base64 string, which you will pass as a Docker build argument:
 
-First clone the repo:
+```bash
+export APPS_JSON_BASE64=$(base64 -w 0 /path/to/apps.json)
+```
 
-```sh
+- To verify, decode and check the output:
+
+```bash
+echo -n ${APPS_JSON_BASE64} | base64 -d > apps-test-output.json
+```
+
+### 3. Build the Custom Docker Image
+
+Clone the official Frappe Docker repository:
+
+```bash
 git clone https://github.com/frappe/frappe_docker
 cd frappe_docker
 ```
 
-Then run: `docker compose -f pwd.yml up -d`
+Build your custom image using the appropriate Dockerfile (e.g., `images/custom/Containerfile`):
+
+```bash
+docker build \
+  --build-arg=FRAPPE_PATH=https://github.com/frappe/frappe \
+  --build-arg=FRAPPE_BRANCH=version-15 \
+  --build-arg=PYTHON_VERSION=3.11.9 \
+  --build-arg=NODE_VERSION=20.19.2 \
+  --build-arg=APPS_JSON_BASE64=$APPS_JSON_BASE64 \
+  --tag=your-registry/frappe-custom:1.0.0 \
+  --file=images/custom/Containerfile .
+```
+
+- Adjust `PYTHON_VERSION` and `NODE_VERSION` as needed for your environment.
+
+### 4. Push the Custom Image to a Registry (if applicable)
+
+If you plan to use your image across servers or deployments, push it to your Docker registry:
+
+```bash
+docker login
+docker push your-registry/frappe-custom:1.0.0
+```
+
+### 5. Configure compose file to Use the Custom Image
+
+In your `pwd.yml` (or inherited compose YAMLs), set the services to use your custom image by defining in the compose file:
+
+```yaml
+services:
+  backend:
+    image: your-registry/frappe-custom:1.0.0
+    networks:
+      - frappe_network
+```
+
+### 6. Modify compose Commands
+
+In the create-site service, include the apps you specified in `apps.json`, to be installed
+
+```yaml
+command:
+      - >
+        wait-for-it -t 120 db:3306;
+        wait-for-it -t 120 redis-cache:6379;
+        wait-for-it -t 120 redis-queue:6379;
+        export start=`date +%s`;
+        until [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".db_host // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_cache // empty"` ]] && \
+          [[ -n `grep -hs ^ sites/common_site_config.json | jq -r ".redis_queue // empty"` ]];
+        do
+          echo "Waiting for sites/common_site_config.json to be created";
+          sleep 5;
+          if (( `date +%s`-start > 120 )); then
+            echo "could not find sites/common_site_config.json with required keys";
+            exit 1
+          fi
+        done;
+        echo "sites/common_site_config.json found";
+        bench new-site --mariadb-user-host-login-scope='%' --admin-password=admin --db-root-username=root --db-root-password=admin --install-app erpnext --install-app wiki --set-default frontend;
+```
+
+### 7. Start Your Environment
+
+Build and start your stack as usual:
+
+```bash
+docker compose -f pwd.yml up
+```
 
 ### To run on ARM64 architecture follow this instructions
 
@@ -45,46 +133,3 @@ Then run: `docker compose -f pwd.yml up -d`
 
 Wait for 5 minutes for ERPNext site to be created or check `create-site` container logs before opening browser on port 8080. (username: `Administrator`, password: `admin`)
 
-If you ran in a Dev Docker environment, to view container logs: `docker compose -f pwd.yml logs -f create-site`. Don't worry about some of the initial error messages, some services take a while to become ready, and then they go away.
-
-# Documentation
-
-### [Frequently Asked Questions](https://github.com/frappe/frappe_docker/wiki/Frequently-Asked-Questions)
-
-### [Production](#production)
-
-- [List of containers](docs/list-of-containers.md)
-- [Single Compose Setup](docs/single-compose-setup.md)
-- [Environment Variables](docs/environment-variables.md)
-- [Single Server Example](docs/single-server-example.md)
-- [Setup Options](docs/setup-options.md)
-- [Site Operations](docs/site-operations.md)
-- [Backup and Push Cron Job](docs/backup-and-push-cronjob.md)
-- [Port Based Multi Tenancy](docs/port-based-multi-tenancy.md)
-- [Migrate from multi-image setup](docs/migrate-from-multi-image-setup.md)
-- [running on linux/mac](docs/setup_for_linux_mac.md)
-- [TLS for local deployment](docs/tls-for-local-deployment.md)
-
-### [Custom Images](#custom-images)
-
-- [Custom Apps](docs/custom-apps.md)
-- [Custom Apps with podman](docs/custom-apps-podman.md)
-- [Build Version 10 Images](docs/build-version-10-images.md)
-
-### [Development](#development)
-
-- [Development using containers](docs/development.md)
-- [Bench Console and VSCode Debugger](docs/bench-console-and-vscode-debugger.md)
-- [Connect to localhost services](docs/connect-to-localhost-services-from-containers-for-local-app-development.md)
-
-### [Troubleshoot](docs/troubleshoot.md)
-
-# Contributing
-
-If you want to contribute to this repo refer to [CONTRIBUTING.md](CONTRIBUTING.md)
-
-This repository is only for container related stuff. You also might want to contribute to:
-
-- [Frappe framework](https://github.com/frappe/frappe#contributing),
-- [ERPNext](https://github.com/frappe/erpnext#contributing),
-- [Frappe Bench](https://github.com/frappe/bench).
